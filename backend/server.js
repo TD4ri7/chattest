@@ -7,7 +7,7 @@ const { createClient } = require('redis');
 const { createAdapter } = require('@socket.io/redis-adapter');
 const admin = require('firebase-admin');
 
-// ---------- Firebase Admin ----------
+// ---------- Firebase Admin (ТОЛЬКО для проверки входа пользователей) ----------
 // Вариант 1 (рекомендуется для Render): весь JSON сервисного аккаунта в одной
 // переменной окружения FIREBASE_SERVICE_ACCOUNT.
 // Вариант 2 (для локальной разработки): файл serviceAccountKey.json рядом с этим файлом.
@@ -19,9 +19,6 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-const db = admin.firestore();
-const messagesCol = db.collection('messages');
-
 // ---------- Express ----------
 const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
@@ -29,42 +26,50 @@ app.use(express.json());
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// История последних сообщений (для загрузки при открытии чата)
-app.get('/messages', async (_req, res) => {
-  try {
-    const snap = await messagesCol.orderBy('createdAt', 'desc').limit(50).get();
-    const messages = snap.docs.map((d) => ({ id: d.id, ...d.data() })).reverse();
-    res.json(messages);
-  } catch (err) {
-    console.error('Ошибка чтения истории:', err);
-    res.status(500).json({ error: 'failed to load messages' });
-  }
-});
-
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: process.env.CORS_ORIGIN || '*' },
 });
 
-// ---------- Redis adapter ----------
-// Нужен, чтобы сообщения доходили до всех пользователей, даже если Render
-// поднимет несколько экземпляров сервера (горизонтальное масштабирование).
+// ---------- Redis: хранение сообщений + pub/sub между инстансами ----------
+const MESSAGES_KEY = 'chat:messages';   // список сообщений (Redis LIST)
+const MAX_MESSAGES = 200;               // сколько последних сообщений храним
+
 const redisUrl = process.env.REDIS_URL;
 if (!redisUrl) {
-  console.warn('REDIS_URL не задан — сервер запустится, но без Redis-адаптера (без масштабирования).');
+  console.warn('REDIS_URL не задан — без него сервер работать не сможет (сообщения хранятся в Redis).');
 }
 
+let redisClient; // обычный клиент — для чтения/записи списка сообщений
+
 async function setupRedis() {
-  if (!redisUrl) return;
-  const pubClient = createClient({ url: redisUrl });
-  const subClient = pubClient.duplicate();
+  redisClient = createClient({ url: redisUrl });
+  redisClient.on('error', (e) => console.error('Redis error', e));
+  await redisClient.connect();
+
+  // Отдельные клиенты для pub/sub адаптера Socket.io (нужны свои соединения)
+  const pubClient = redisClient.duplicate();
+  const subClient = redisClient.duplicate();
   pubClient.on('error', (e) => console.error('Redis pub error', e));
   subClient.on('error', (e) => console.error('Redis sub error', e));
   await Promise.all([pubClient.connect(), subClient.connect()]);
   io.adapter(createAdapter(pubClient, subClient));
-  console.log('Redis adapter подключён');
+
+  console.log('Redis подключён (хранение сообщений + адаптер Socket.io)');
 }
-setupRedis().catch((err) => console.error('Не удалось подключиться к Redis:', err));
+
+// История последних сообщений — читаем прямо из Redis
+app.get('/messages', async (_req, res) => {
+  try {
+    if (!redisClient) return res.json([]);
+    const raw = await redisClient.lRange(MESSAGES_KEY, -50, -1); // последние 50
+    const messages = raw.map((item) => JSON.parse(item));
+    res.json(messages);
+  } catch (err) {
+    console.error('Ошибка чтения истории из Redis:', err);
+    res.status(500).json({ error: 'failed to load messages' });
+  }
+});
 
 // ---------- Аутентификация сокетов через Firebase ID token ----------
 io.use(async (socket, next) => {
@@ -93,9 +98,13 @@ io.on('connection', (socket) => {
     if (!message.text) return;
 
     try {
-      await messagesCol.add(message);
+      if (redisClient) {
+        await redisClient.rPush(MESSAGES_KEY, JSON.stringify(message));
+        // Обрезаем список, чтобы не рос бесконечно — оставляем последние MAX_MESSAGES
+        await redisClient.lTrim(MESSAGES_KEY, -MAX_MESSAGES, -1);
+      }
     } catch (err) {
-      console.error('Ошибка записи в Firestore:', err);
+      console.error('Ошибка записи сообщения в Redis:', err);
     }
 
     // io.emit проходит через Redis adapter и уходит всем клиентам на всех инстансах
@@ -113,4 +122,11 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Сервер запущен на порту ${PORT}`));
+setupRedis()
+  .then(() => {
+    server.listen(PORT, () => console.log(`Сервер запущен на порту ${PORT}`));
+  })
+  .catch((err) => {
+    console.error('Не удалось подключиться к Redis, сервер не запущен:', err);
+    process.exit(1);
+  });
